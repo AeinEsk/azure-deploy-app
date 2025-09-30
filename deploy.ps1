@@ -37,7 +37,7 @@ try {
     # Set tenant context if provided
     if ($TenantId) {
         Write-Host "🏢 Setting tenant context..." -ForegroundColor Blue
-        az account set --subscription $SubscriptionId --tenant $TenantId
+        az login --tenant $TenantId
     }
     
     # Function to create app registration
@@ -52,19 +52,15 @@ try {
         
         Write-Host "🔑 Creating $DisplayName App Registration..." -ForegroundColor Blue
         
-        # Build the command
+        # Build the command - use correct Azure CLI syntax
         $createCommand = "az ad app create --display-name `"$DisplayName`" --identifier-uris `"$IdentifierUri`""
         
         if ($ReplyUrl) {
-            $createCommand += " --reply-urls `"$ReplyUrl`""
+            $createCommand += " --web-redirect-uris `"$ReplyUrl`""
         }
         
         if ($LogoutUrl) {
-            $createCommand += " --logout-url `"$LogoutUrl`""
-        }
-        
-        if ($Description) {
-            $createCommand += " --description `"$Description`""
+            $createCommand += " --web-logout-url `"$LogoutUrl`""
         }
         
         # Execute the command
@@ -103,7 +99,7 @@ try {
     $apps = @()
     
     # 1. Fulfilment API App Registration
-    $fulfilmentApi = Create-AppRegistration -DisplayName "FulfilmentAPI-$Environment" -IdentifierUri "api://fulfilment-$Environment" -Description "Fulfilment API for $Environment environment"
+    $fulfilmentApi = Create-AppRegistration -DisplayName "FulfilmentAPI-$Environment" -IdentifierUri "api://fulfilment-$Environment"
     if ($fulfilmentApi) {
         $apps += @{
             Name = "FulfilmentAPI"
@@ -113,7 +109,7 @@ try {
     }
     
     # 2. Admin Portal SSO App Registration
-    $adminPortal = Create-AppRegistration -DisplayName "AdminPortal-SSO-$Environment" -IdentifierUri "https://admin-portal-$Environment" -ReplyUrl "https://admin-portal-$Environment/auth/callback" -LogoutUrl "https://admin-portal-$Environment/auth/logout" -Description "Admin Portal SSO for $Environment environment"
+    $adminPortal = Create-AppRegistration -DisplayName "AdminPortal-SSO-$Environment" -IdentifierUri "https://admin-portal-$Environment" -ReplyUrl "https://admin-portal-$Environment/auth/callback" -LogoutUrl "https://admin-portal-$Environment/auth/logout"
     if ($adminPortal) {
         $apps += @{
             Name = "AdminPortal-SSO"
@@ -123,7 +119,7 @@ try {
     }
     
     # 3. Landing Page SSO App Registration
-    $landingPage = Create-AppRegistration -DisplayName "LandingPage-SSO-$Environment" -IdentifierUri "https://landing-page-$Environment" -ReplyUrl "https://landing-page-$Environment/auth/callback" -LogoutUrl "https://landing-page-$Environment/auth/logout" -Description "Landing Page SSO for $Environment environment"
+    $landingPage = Create-AppRegistration -DisplayName "LandingPage-SSO-$Environment" -IdentifierUri "https://landing-page-$Environment" -ReplyUrl "https://landing-page-$Environment/auth/callback" -LogoutUrl "https://landing-page-$Environment/auth/logout"
     if ($landingPage) {
         $apps += @{
             Name = "LandingPage-SSO"
