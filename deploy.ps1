@@ -13,7 +13,19 @@ param(
     [string]$Environment = "dev",
     
     [Parameter(Mandatory=$false)]
-    [string]$LogoURLpng = ""
+    [string]$LogoURLpng = "",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$KeyVault,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$ResourceGroupForDeployment = "Marketplace-Subscription",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$Location = "East US 2",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$AzureSubscriptionID
 )
 
 # Set error action preference
@@ -38,7 +50,21 @@ try {
         Write-Host "🔑 Tenant provided: $TenantId" -ForegroundColor Blue
     }
     
+    # Get Azure Subscription if not set as argument
+    if(!($AzureSubscriptionID)) {    
+        Write-Host "🔑 Azure Subscription not provided, using current subscription: $currentSubscription" -ForegroundColor Blue
+        $AzureSubscriptionID = $currentSubscription
+    }
+    else {
+        Write-Host "🔑 Azure Subscription provided: $AzureSubscriptionID" -ForegroundColor Blue
+    }
+    
     Write-Host "Tenant ID: $TenantId" -ForegroundColor Yellow
+    Write-Host "Subscription ID: $AzureSubscriptionID" -ForegroundColor Yellow
+    
+    # Set the AZ Cli context
+    az account set -s $AzureSubscriptionID
+    Write-Host "🔑 Azure Subscription '$AzureSubscriptionID' selected." -ForegroundColor Green
     
     # Set tenant context if different from current
     if ($currentTenant -ne $TenantId) {
@@ -47,6 +73,14 @@ try {
     } else {
         Write-Host "✅ Already authenticated with correct tenant" -ForegroundColor Green
     }
+    
+    # Set up Key Vault variables
+    if ($KeyVault -eq "") {
+        $KeyVault = $WebAppNamePrefix + "-kv"
+    }
+    
+    Write-Host "Key Vault: $KeyVault" -ForegroundColor Yellow
+    Write-Host "Resource Group: $ResourceGroupForDeployment" -ForegroundColor Yellow
     
     # Function to create FulfilmentAPI app registration (simple method)
     function Create-FulfilmentAPI {
@@ -212,12 +246,81 @@ try {
         }
     }
     
+    # Key Vault setup and secret storage
+    Write-Host "`n🔐 Setting up Key Vault..." -ForegroundColor Blue
+    
+    # Check if Key Vault exists under resource group
+    $kv_check = az keyvault show -n $KeyVault -g $ResourceGroupForDeployment 2>$null
+    
+    if ($kv_check) {
+        Write-Host "✅ Key Vault '$KeyVault' already exists" -ForegroundColor Green
+    } else {
+        # If KeyVault does not exist under resource group, check if it's deleted
+        if ($kv_check -eq $null) {
+            # Check if KeyVault exists globally
+            $KeyVaultApiUri = "https://management.azure.com/subscriptions/$AzureSubscriptionID/providers/Microsoft.KeyVault/checkNameAvailability?api-version=2019-09-01"
+            $KeyVaultApiBody = '{"name": "' + $KeyVault + '","type": "Microsoft.KeyVault/vaults"}'
+            
+            $kv_check = az rest --method post --uri $KeyVaultApiUri --headers 'Content-Type=application/json' --body $KeyVaultApiBody | ConvertFrom-Json
+            
+            if ($kv_check.reason -eq "AlreadyExists") {
+                Write-Host ""
+                Write-Host "🛑  KeyVault name " -NoNewline -ForegroundColor Red
+                Write-Host "$KeyVault" -NoNewline -ForegroundColor Red -BackgroundColor Yellow
+                Write-Host " already exists." -ForegroundColor Red
+                Write-Host "   To Purge KeyVault please use the following doc:" -ForegroundColor Yellow
+                Write-Host "   https://learn.microsoft.com/en-us/cli/azure/keyvault?view=azure-cli-latest#az-keyvault-purge." -ForegroundColor Yellow
+                Write-Host "   You could use new KeyVault name by using parameter" -NoNewline -ForegroundColor Yellow
+                Write-Host " -KeyVault" -ForegroundColor Green
+                exit 1
+            }
+        }
+        
+        Write-Host "🔵 Creating Key Vault '$KeyVault'..." -ForegroundColor Blue
+        
+        # Create resource group if it doesn't exist
+        $rgExists = az group show --name $ResourceGroupForDeployment 2>$null
+        if (-not $rgExists) {
+            Write-Host "   ➡️ Creating Resource Group '$ResourceGroupForDeployment'..." -ForegroundColor Blue
+            az group create --location $Location --name $ResourceGroupForDeployment
+        }
+        
+        # Create Key Vault
+        Write-Host "   ➡️ Creating Key Vault..." -ForegroundColor Blue
+        az keyvault create --name $KeyVault --resource-group $ResourceGroupForDeployment --enable-rbac-authorization false
+        Write-Host "✅ Key Vault '$KeyVault' created successfully" -ForegroundColor Green
+    }
+    
+    # Store app registration secrets in Key Vault
+    Write-Host "`n💾 Storing secrets in Key Vault..." -ForegroundColor Blue
+    
+    foreach ($app in $apps) {
+        if ($app.Name -eq "FulfilmentAPI" -and $app.ClientSecret) {
+            Write-Host "   ➡️ Storing FulfilmentAPI client secret..." -ForegroundColor Blue
+            az keyvault secret set --vault-name $KeyVault --name "FulfilmentAPI-ClientSecret" --value $app.ClientSecret
+            Write-Host "   ✅ FulfilmentAPI client secret stored" -ForegroundColor Green
+        }
+        
+        Write-Host "   ➡️ Storing $($app.Name) App ID..." -ForegroundColor Blue
+        az keyvault secret set --vault-name $KeyVault --name "$($app.Name)-ClientId" --value $app.AppId
+        Write-Host "   ✅ $($app.Name) App ID stored" -ForegroundColor Green
+    }
+    
+    # Store tenant ID
+    Write-Host "   ➡️ Storing Tenant ID..." -ForegroundColor Blue
+    az keyvault secret set --vault-name $KeyVault --name "TenantId" --value $TenantId
+    Write-Host "   ✅ Tenant ID stored" -ForegroundColor Green
+    
     # Generate configuration file
     Write-Host "📄 Generating configuration file..." -ForegroundColor Blue
     $config = @{
         Environment = $Environment
         WebAppNamePrefix = $WebAppNamePrefix
         TenantId = $TenantId
+        AzureSubscriptionID = $AzureSubscriptionID
+        KeyVault = $KeyVault
+        ResourceGroupForDeployment = $ResourceGroupForDeployment
+        Location = $Location
         Apps = $apps
         CreatedAt = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
     }
@@ -243,10 +346,11 @@ try {
     }
     
     Write-Host "`n⚠️  IMPORTANT SECURITY NOTES:" -ForegroundColor Yellow
-    Write-Host "1. Store client secrets securely (Azure Key Vault recommended)" -ForegroundColor Yellow
+    Write-Host "1. Client secrets have been stored securely in Azure Key Vault: $KeyVault" -ForegroundColor Yellow
     Write-Host "2. Rotate secrets regularly" -ForegroundColor Yellow
     Write-Host "3. Use environment-specific configurations" -ForegroundColor Yellow
     Write-Host "4. Review and configure API permissions as needed" -ForegroundColor Yellow
+    Write-Host "5. Key Vault secrets are ready for use by the SaaS Accelerator deployment" -ForegroundColor Yellow
     
 } catch {
     Write-Host "❌ Error occurred: $($_.Exception.Message)" -ForegroundColor Red
