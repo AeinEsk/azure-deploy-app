@@ -3,101 +3,166 @@
 # Run this script with elevated privileges in Azure Cloud Shell or with proper permissions
 
 param(
-    [Parameter(Mandatory=$true)]
-    # [string]$SubscriptionId ="a2314f4b-7f4d-4222-9561-5e56999d1807",
-    [string]$SubscriptionId ="f29144a9-edfd-4457-addf-467bfe4b36a7",
-
     [Parameter(Mandatory=$false)]
-    [string]$TenantId = "5039811d-facd-4588-be65-44a2ecd7fae1",
+    [string]$WebAppNamePrefix = "mp-subscription",
     
     [Parameter(Mandatory=$false)]
-    [string]$Environment = "dev"
+    [string]$TenantId,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$Environment = "dev",
+    
+    [Parameter(Mandatory=$false)]
+    [string]$LogoURLpng = ""
 )
 
 # Set error action preference
 $ErrorActionPreference = "Stop"
 
 Write-Host "🚀 Starting Azure AD App Registration Creation" -ForegroundColor Green
-Write-Host "Subscription ID: $SubscriptionId" -ForegroundColor Yellow
+Write-Host "Web App Name Prefix: $WebAppNamePrefix" -ForegroundColor Yellow
 Write-Host "Environment: $Environment" -ForegroundColor Yellow
 
 try {
-    # Set the subscription context
-    Write-Host "📋 Setting Azure subscription context..." -ForegroundColor Blue
-    az account set --subscription $SubscriptionId
+    # Get current context
+    $currentContext = az account show | ConvertFrom-Json
+    $currentTenant = $currentContext.tenantId
+    $currentSubscription = $currentContext.id
     
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to set subscription context"
+    # Get TenantID if not set as argument
+    if(!($TenantId)) {    
+        Write-Host "🔑 Tenant ID not provided, using current tenant: $currentTenant" -ForegroundColor Blue
+        $TenantId = $currentTenant
+    }
+    else {
+        Write-Host "🔑 Tenant provided: $TenantId" -ForegroundColor Blue
     }
     
-    # Get current subscription info
-    $subscriptionInfo = az account show --query "{name:name, id:id}" -o json | ConvertFrom-Json
-    Write-Host "✅ Connected to subscription: $($subscriptionInfo.name)" -ForegroundColor Green
+    Write-Host "Tenant ID: $TenantId" -ForegroundColor Yellow
     
-    # Set tenant context if provided
-    if ($TenantId) {
-        Write-Host "🏢 Setting tenant context..." -ForegroundColor Blue
-        # Check if already logged in to the correct tenant
-        $currentTenant = az account show --query tenantId -o tsv
-        if ($currentTenant -ne $TenantId) {
-            Write-Host "Switching to tenant: $TenantId" -ForegroundColor Yellow
-            az login --tenant $TenantId --use-device-code
-        } else {
-            Write-Host "Already authenticated with correct tenant" -ForegroundColor Green
-        }
+    # Set tenant context if different from current
+    if ($currentTenant -ne $TenantId) {
+        Write-Host "🏢 Switching to tenant: $TenantId" -ForegroundColor Blue
+        az login --tenant $TenantId --use-device-code
+    } else {
+        Write-Host "✅ Already authenticated with correct tenant" -ForegroundColor Green
     }
     
-    # Function to create app registration
-    function Create-AppRegistration {
+    # Function to create FulfilmentAPI app registration (simple method)
+    function Create-FulfilmentAPI {
         param(
-            [string]$DisplayName,
-            [string]$IdentifierUri,
-            [string]$ReplyUrl = "",
-            [string]$LogoutUrl = "",
-            [string]$Description = ""
+            [string]$DisplayName
         )
         
         Write-Host "🔑 Creating $DisplayName App Registration..." -ForegroundColor Blue
         
-        # Build the command - use correct Azure CLI syntax
-        $createCommand = "az ad app create --display-name `"$DisplayName`" --identifier-uris `"$IdentifierUri`""
-        
-        if ($ReplyUrl) {
-            $createCommand += " --web-redirect-uris `"$ReplyUrl`""
-        }
-        
-        if ($LogoutUrl) {
-            $createCommand += " --web-logout-url `"$LogoutUrl`""
-        }
-        
-        # Execute the command
-        $result = Invoke-Expression $createCommand
-        
-        if ($LASTEXITCODE -eq 0) {
-            $appInfo = $result | ConvertFrom-Json
-            Write-Host "✅ $DisplayName App Registration created successfully" -ForegroundColor Green
-            Write-Host "   ➡️ Application ID: $($appInfo.appId)" -ForegroundColor Cyan
-            Write-Host "   ➡️ Object ID: $($appInfo.id)" -ForegroundColor Cyan
+        try {
+            $ADApplication = az ad app create --only-show-errors --sign-in-audience AzureADMYOrg --display-name $DisplayName | ConvertFrom-Json
+            $ADObjectID = $ADApplication.id
+            $ADApplicationID = $ADApplication.appId
+            sleep 5 # Give time to AAD to register
             
-            # Create client secret
-            Write-Host "🔐 Creating client secret for $DisplayName..." -ForegroundColor Blue
-            $secretResult = az ad app credential reset --id $appInfo.appId --query "{appId:appId, password:password}" -o json | ConvertFrom-Json
+            # Create service principal
+            az ad sp create --id $ADApplicationID
+            $ADApplicationSecret = az ad app credential reset --id $ADObjectID --append --display-name 'SaaSAPI' --years 2 --query password --only-show-errors --output tsv
             
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "✅ Client secret created for $DisplayName" -ForegroundColor Green
-                Write-Host "   ➡️ Client Secret: $($secretResult.password)" -ForegroundColor Red
-                Write-Host "   ⚠️  IMPORTANT: Save this secret securely!" -ForegroundColor Yellow
-            } else {
-                Write-Host "❌ Failed to create client secret for $DisplayName" -ForegroundColor Red
+            Write-Host "   🔵 $DisplayName App Registration created." -ForegroundColor Green
+            Write-Host "      ➡️ Application ID: $ADApplicationID" -ForegroundColor Cyan
+            
+            return @{
+                AppId = $ADApplicationID
+                ObjectId = $ADObjectID
+                ClientSecret = $ADApplicationSecret
+            }
+        }
+        catch {
+            Write-Host "   ❌ Failed to create $DisplayName App Registration" -ForegroundColor Red
+            Write-Host "      Error: $($_.Exception.Message)" -ForegroundColor Red
+            return $null
+        }
+    }
+    
+    # Function to create SSO app registration (Graph API method)
+    function Create-SSOAppRegistration {
+        param(
+            [string]$DisplayName,
+            [string]$SignInAudience,
+            [string]$RedirectUris,
+            [string]$LogoutUrl
+        )
+        
+        Write-Host "🔑 Creating $DisplayName App Registration..." -ForegroundColor Blue
+        
+        try {
+            $appCreateRequestBodyJson = @"
+{
+    "displayName" : "$DisplayName",
+    "api": 
+    {
+        "requestedAccessTokenVersion" : 2
+    },
+    "signInAudience" : "$SignInAudience",
+    "web":
+    { 
+        "redirectUris": 
+        [
+            $RedirectUris
+        ],
+        "logoutUrl": "$LogoutUrl",
+        "implicitGrantSettings": 
+            { "enableIdTokenIssuance" : true }
+    },
+    "requiredResourceAccess":
+    [{
+        "resourceAppId": "00000003-0000-0000-c000-000000000000",
+        "resourceAccess":
+            [{ 
+                "id": "e1fe6dd8-ba31-4d61-89e7-88639da4683d",
+                "type": "Scope" 
+            }]
+    }]
+}
+"@
+            
+            if ($PsVersionTable.Platform -ne 'Unix') {
+                # On Windows, escape quotes and remove new lines
+                $appCreateRequestBodyJson = $appCreateRequestBodyJson.replace('"','\"').replace("`r`n","")
+            }
+            
+            $appReg = $(az rest --method POST --headers "Content-Type=application/json" --uri https://graph.microsoft.com/v1.0/applications --body $appCreateRequestBodyJson) | ConvertFrom-Json
+            
+            $AppId = $appReg.appId
+            $ObjectId = $appReg.id
+            
+            Write-Host "   🔵 $DisplayName App Registration created." -ForegroundColor Green
+            Write-Host "      ➡️ Application ID: $AppId" -ForegroundColor Cyan
+            
+            # Set logo if provided
+            if ($LogoURLpng) {
+                Write-Host "      ➡️ Setting application logo..." -ForegroundColor Blue
+                $token = (az account get-access-token --resource "https://graph.microsoft.com" --query accessToken --output tsv)
+                $logoWeb = Invoke-WebRequest $LogoURLpng
+                $logoContentType = $logoWeb.Headers["Content-Type"]
+                $logoContent = $logoWeb.Content
+                
+                $uploaded = Invoke-WebRequest `
+                    -Uri "https://graph.microsoft.com/v1.0/applications/$ObjectId/logo" `
+                    -Method "PUT" `
+                    -Header @{"Authorization"="Bearer $token";"Content-Type"="$logoContentType";} `
+                    -Body $logoContent
+                
+                Write-Host "      ➡️ Application logo set." -ForegroundColor Green
             }
             
             return @{
-                AppId = $appInfo.appId
-                ObjectId = $appInfo.id
-                ClientSecret = $secretResult.password
+                AppId = $AppId
+                ObjectId = $ObjectId
+                ClientSecret = "" # SSO apps don't need client secrets
             }
-        } else {
-            Write-Host "❌ Failed to create $DisplayName App Registration" -ForegroundColor Red
+        }
+        catch {
+            Write-Host "   ❌ Failed to create $DisplayName App Registration" -ForegroundColor Red
+            Write-Host "      Error: $($_.Exception.Message)" -ForegroundColor Red
             return $null
         }
     }
@@ -105,8 +170,8 @@ try {
     # Create app registrations
     $apps = @()
     
-    # 1. Fulfilment API App Registration
-    $fulfilmentApi = Create-AppRegistration -DisplayName "FulfilmentAPI-$Environment" -IdentifierUri "api://fulfilment-$Environment"
+    # 1. Fulfilment API App Registration (simple method)
+    $fulfilmentApi = Create-FulfilmentAPI -DisplayName "$WebAppNamePrefix-FulfillmentAppReg"
     if ($fulfilmentApi) {
         $apps += @{
             Name = "FulfilmentAPI"
@@ -115,8 +180,14 @@ try {
         }
     }
     
-    # 2. Admin Portal SSO App Registration
-    $adminPortal = Create-AppRegistration -DisplayName "AdminPortal-SSO-$Environment" -IdentifierUri "https://admin-portal-$Environment" -ReplyUrl "https://admin-portal-$Environment/auth/callback" -LogoutUrl "https://admin-portal-$Environment/auth/logout"
+    # 2. Admin Portal SSO App Registration (Graph API method)
+    $adminRedirectUris = @"
+            "https://$WebAppNamePrefix-admin.azurewebsites.net",
+            "https://$WebAppNamePrefix-admin.azurewebsites.net/",
+            "https://$WebAppNamePrefix-admin.azurewebsites.net/Home/Index",
+            "https://$WebAppNamePrefix-admin.azurewebsites.net/Home/Index/"
+"@
+    $adminPortal = Create-SSOAppRegistration -DisplayName "$WebAppNamePrefix-AdminPortalAppReg" -SignInAudience "AzureADMyOrg" -RedirectUris $adminRedirectUris -LogoutUrl "https://$WebAppNamePrefix-admin.azurewebsites.net/logout"
     if ($adminPortal) {
         $apps += @{
             Name = "AdminPortal-SSO"
@@ -125,8 +196,14 @@ try {
         }
     }
     
-    # 3. Landing Page SSO App Registration
-    $landingPage = Create-AppRegistration -DisplayName "LandingPage-SSO-$Environment" -IdentifierUri "https://landing-page-$Environment" -ReplyUrl "https://landing-page-$Environment/auth/callback" -LogoutUrl "https://landing-page-$Environment/auth/logout"
+    # 3. Landing Page SSO App Registration (Graph API method)
+    $landingRedirectUris = @"
+            "https://$WebAppNamePrefix-portal.azurewebsites.net",
+            "https://$WebAppNamePrefix-portal.azurewebsites.net/",
+            "https://$WebAppNamePrefix-portal.azurewebsites.net/Home/Index",
+            "https://$WebAppNamePrefix-portal.azurewebsites.net/Home/Index/"
+"@
+    $landingPage = Create-SSOAppRegistration -DisplayName "$WebAppNamePrefix-LandingpageAppReg" -SignInAudience "AzureADandPersonalMicrosoftAccount" -RedirectUris $landingRedirectUris -LogoutUrl "https://$WebAppNamePrefix-portal.azurewebsites.net/logout"
     if ($landingPage) {
         $apps += @{
             Name = "LandingPage-SSO"
@@ -139,7 +216,7 @@ try {
     Write-Host "📄 Generating configuration file..." -ForegroundColor Blue
     $config = @{
         Environment = $Environment
-        SubscriptionId = $SubscriptionId
+        WebAppNamePrefix = $WebAppNamePrefix
         TenantId = $TenantId
         Apps = $apps
         CreatedAt = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
@@ -155,7 +232,7 @@ try {
     Write-Host "`n🎉 Azure AD App Registration Creation Complete!" -ForegroundColor Green
     Write-Host "=" * 60 -ForegroundColor Cyan
     Write-Host "Environment: $Environment" -ForegroundColor Yellow
-    Write-Host "Subscription: $($subscriptionInfo.name)" -ForegroundColor Yellow
+    Write-Host "Web App Name Prefix: $WebAppNamePrefix" -ForegroundColor Yellow
     Write-Host "Total Apps Created: $($apps.Count)" -ForegroundColor Yellow
     Write-Host "=" * 60 -ForegroundColor Cyan
     
