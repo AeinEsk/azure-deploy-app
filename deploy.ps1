@@ -37,7 +37,14 @@ try {
     # Set tenant context if provided
     if ($TenantId) {
         Write-Host "🏢 Setting tenant context..." -ForegroundColor Blue
-        az login --tenant $TenantId
+        # Check if already logged in to the correct tenant
+        $currentTenant = az account show --query tenantId -o tsv
+        if ($currentTenant -ne $TenantId) {
+            Write-Host "Switching to tenant: $TenantId" -ForegroundColor Yellow
+            az login --tenant $TenantId --use-device-code
+        } else {
+            Write-Host "Already authenticated with correct tenant" -ForegroundColor Green
+        }
     }
     
     # Function to create app registration
