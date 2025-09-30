@@ -5,7 +5,7 @@
 param(
     [Parameter(Mandatory=$true)]
     # [string]$SubscriptionId ="a2314f4b-7f4d-4222-9561-5e56999d1807",
-    [string]$SubscriptionId ="f29144a9-edfd-4457-addf-467bfe4b36a7"
+    [string]$SubscriptionId ="f29144a9-edfd-4457-addf-467bfe4b36a7",
 
     [Parameter(Mandatory=$false)]
     [string]$TenantId = "5039811d-facd-4588-be65-44a2ecd7fae1",
