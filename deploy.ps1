@@ -250,14 +250,21 @@ try {
     Write-Host "`n🔐 Setting up Key Vault..." -ForegroundColor Blue
     
     # Check if Key Vault exists under resource group
-    $kv_check = az keyvault show -n $KeyVault -g $ResourceGroupForDeployment 2>$null
+    $kvExists = $false
+    try {
+        $kv_check = az keyvault show -n $KeyVault -g $ResourceGroupForDeployment 2>$null
+        if ($LASTEXITCODE -eq 0 -and $kv_check) {
+            $kvExists = $true
+            Write-Host "✅ Key Vault '$KeyVault' already exists" -ForegroundColor Green
+        }
+    }
+    catch {
+        # Key Vault doesn't exist, continue with creation
+    }
     
-    if ($kv_check) {
-        Write-Host "✅ Key Vault '$KeyVault' already exists" -ForegroundColor Green
-    } else {
-        # If KeyVault does not exist under resource group, check if it's deleted
-        if ($kv_check -eq $null) {
-            # Check if KeyVault exists globally
+    if (-not $kvExists) {
+        # Check if KeyVault exists globally (might be deleted but not purged)
+        try {
             $KeyVaultApiUri = "https://management.azure.com/subscriptions/$AzureSubscriptionID/providers/Microsoft.KeyVault/checkNameAvailability?api-version=2019-09-01"
             $KeyVaultApiBody = '{"name": "' + $KeyVault + '","type": "Microsoft.KeyVault/vaults"}'
             
@@ -275,11 +282,24 @@ try {
                 exit 1
             }
         }
+        catch {
+            # API call failed, assume name is available
+        }
         
         Write-Host "🔵 Creating Key Vault '$KeyVault'..." -ForegroundColor Blue
         
         # Create resource group if it doesn't exist
-        $rgExists = az group show --name $ResourceGroupForDeployment 2>$null
+        $rgExists = $false
+        try {
+            $rg_check = az group show --name $ResourceGroupForDeployment 2>$null
+            if ($LASTEXITCODE -eq 0 -and $rg_check) {
+                $rgExists = $true
+            }
+        }
+        catch {
+            # Resource group doesn't exist
+        }
+        
         if (-not $rgExists) {
             Write-Host "   ➡️ Creating Resource Group '$ResourceGroupForDeployment'..." -ForegroundColor Blue
             az group create --location $Location --name $ResourceGroupForDeployment
