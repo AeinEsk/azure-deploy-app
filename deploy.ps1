@@ -249,66 +249,31 @@ try {
     # Key Vault setup and secret storage
     Write-Host "`n🔐 Setting up Key Vault..." -ForegroundColor Blue
     
-    # Check if Key Vault exists under resource group
-    $kvExists = $false
-    try {
-        $kv_check = az keyvault show -n $KeyVault -g $ResourceGroupForDeployment 2>$null
-        if ($LASTEXITCODE -eq 0 -and $kv_check) {
-            $kvExists = $true
-            Write-Host "✅ Key Vault '$KeyVault' already exists" -ForegroundColor Green
-        }
-    }
-    catch {
-        # Key Vault doesn't exist, continue with creation
+    # Create resource group if it doesn't exist
+    Write-Host "   ➡️ Checking Resource Group..." -ForegroundColor Blue
+    $rgExists = az group show --name $ResourceGroupForDeployment 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "   ➡️ Creating Resource Group '$ResourceGroupForDeployment'..." -ForegroundColor Blue
+        az group create --location $Location --name $ResourceGroupForDeployment
+        Write-Host "   ✅ Resource Group created" -ForegroundColor Green
+    } else {
+        Write-Host "   ✅ Resource Group already exists" -ForegroundColor Green
     }
     
-    if (-not $kvExists) {
-        # Check if KeyVault exists globally (might be deleted but not purged)
-        try {
-            $KeyVaultApiUri = "https://management.azure.com/subscriptions/$AzureSubscriptionID/providers/Microsoft.KeyVault/checkNameAvailability?api-version=2019-09-01"
-            $KeyVaultApiBody = '{"name": "' + $KeyVault + '","type": "Microsoft.KeyVault/vaults"}'
-            
-            $kv_check = az rest --method post --uri $KeyVaultApiUri --headers 'Content-Type=application/json' --body $KeyVaultApiBody | ConvertFrom-Json
-            
-            if ($kv_check.reason -eq "AlreadyExists") {
-                Write-Host ""
-                Write-Host "🛑  KeyVault name " -NoNewline -ForegroundColor Red
-                Write-Host "$KeyVault" -NoNewline -ForegroundColor Red -BackgroundColor Yellow
-                Write-Host " already exists." -ForegroundColor Red
-                Write-Host "   To Purge KeyVault please use the following doc:" -ForegroundColor Yellow
-                Write-Host "   https://learn.microsoft.com/en-us/cli/azure/keyvault?view=azure-cli-latest#az-keyvault-purge." -ForegroundColor Yellow
-                Write-Host "   You could use new KeyVault name by using parameter" -NoNewline -ForegroundColor Yellow
-                Write-Host " -KeyVault" -ForegroundColor Green
-                exit 1
-            }
-        }
-        catch {
-            # API call failed, assume name is available
-        }
-        
-        Write-Host "🔵 Creating Key Vault '$KeyVault'..." -ForegroundColor Blue
-        
-        # Create resource group if it doesn't exist
-        $rgExists = $false
-        try {
-            $rg_check = az group show --name $ResourceGroupForDeployment 2>$null
-            if ($LASTEXITCODE -eq 0 -and $rg_check) {
-                $rgExists = $true
-            }
-        }
-        catch {
-            # Resource group doesn't exist
-        }
-        
-        if (-not $rgExists) {
-            Write-Host "   ➡️ Creating Resource Group '$ResourceGroupForDeployment'..." -ForegroundColor Blue
-            az group create --location $Location --name $ResourceGroupForDeployment
-        }
-        
-        # Create Key Vault
-        Write-Host "   ➡️ Creating Key Vault..." -ForegroundColor Blue
+    # Check if Key Vault exists
+    Write-Host "   ➡️ Checking Key Vault..." -ForegroundColor Blue
+    $kvExists = az keyvault show --name $KeyVault --resource-group $ResourceGroupForDeployment 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "✅ Key Vault '$KeyVault' already exists" -ForegroundColor Green
+    } else {
+        Write-Host "   ➡️ Creating Key Vault '$KeyVault'..." -ForegroundColor Blue
         az keyvault create --name $KeyVault --resource-group $ResourceGroupForDeployment --enable-rbac-authorization false
-        Write-Host "✅ Key Vault '$KeyVault' created successfully" -ForegroundColor Green
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "✅ Key Vault '$KeyVault' created successfully" -ForegroundColor Green
+        } else {
+            Write-Host "❌ Failed to create Key Vault. Please check the error above." -ForegroundColor Red
+            exit 1
+        }
     }
     
     # Store app registration secrets in Key Vault
