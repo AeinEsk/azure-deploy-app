@@ -144,7 +144,10 @@ try {
         ],
         "logoutUrl": "$LogoutUrl",
         "implicitGrantSettings": 
-            { "enableIdTokenIssuance" : true }
+            { 
+                "enableIdTokenIssuance" : true,
+                "enableAccessTokenIssuance" : false
+            }
     },
     "requiredResourceAccess":
     [{
@@ -170,6 +173,7 @@ try {
             
             Write-Host "   🔵 $DisplayName App Registration created." -ForegroundColor Green
             Write-Host "      ➡️ Application ID: $AppId" -ForegroundColor Cyan
+            Write-Host "      ➡️ ID tokens enabled for implicit grant" -ForegroundColor Green
             
             # Set logo if provided
             if ($LogoURLpng) {
