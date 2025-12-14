@@ -137,6 +137,7 @@ if ($SQLDatabaseName -eq "") {
     $SQLDatabaseName = $WebAppNamePrefix +"AMPSaaSDB"
 }
 
+
 if($KeyVault -eq "")
 {
 # User did not define KeyVault, so we will create one. 
@@ -171,6 +172,38 @@ if($KeyVault -eq "")
 	#endregion
 	}
 
+}
+else {
+    # User specified a KeyVault, check if it exists and create if needed
+    Write-Host "🔑 Using specified KeyVault: $KeyVault" -ForegroundColor Green
+    Write-Host "🔑 KeyVault Resource Group: $ResourceGroupForDeployment" -ForegroundColor Green
+    
+    $kv_check=$(az keyvault show -n $KeyVault -g $ResourceGroupForDeployment) 2>$null
+    if($kv_check -eq $null)
+    {
+        Write-Host "🔑 KeyVault '$KeyVault' not found, creating it..." -ForegroundColor Yellow
+        
+        # Check if KeyVault name is available globally
+        $KeyVaultApiUri="https://management.azure.com/subscriptions/$AzureSubscriptionID/providers/Microsoft.KeyVault/checkNameAvailability?api-version=2019-09-01"
+        $KeyVaultApiBody='{"name": "'+$KeyVault+'","type": "Microsoft.KeyVault/vaults"}'
+        $kv_check=az rest --method post --uri $KeyVaultApiUri --headers 'Content-Type=application/json' --body $KeyVaultApiBody | ConvertFrom-Json
+
+        if( $kv_check.reason -eq "AlreadyExists")
+        {
+            Write-Host ""
+            Write-Host "🛑  KeyVault name "  -NoNewline -ForegroundColor Red
+            Write-Host "$KeyVault"  -NoNewline -ForegroundColor Red -BackgroundColor Yellow
+            Write-Host " already exists in another resource group." -ForegroundColor Red
+            Write-Host "   Please specify a different KeyVault name or use the existing one in its current resource group."
+            exit 1
+        }
+        else {
+            Write-Host "✅ KeyVault name is available, will be created during deployment" -ForegroundColor Green
+        }
+    }
+    else {
+        Write-Host "✅ Existing KeyVault found and ready for configuration" -ForegroundColor Green
+    }
 }
 
 $SaaSApiConfiguration_CodeHash= git log --format='%H' -1
@@ -217,18 +250,9 @@ az account get-access-token --resource https://graph.microsoft.com/ --output non
 Write-host "✅ Azure CLI tokens refreshed"
 
 
-#region Check If SQL Server Exist
-$sql_exists = Get-AzureRmSqlServer -ServerName $SQLServerName -ResourceGroupName $ResourceGroupForDeployment -ErrorAction SilentlyContinue
-if ($sql_exists) 
-{
-	Write-Host ""
-	Write-Host "🛑 SQl Server name " -NoNewline -ForegroundColor Red
-	Write-Host "$SQLServerName"   -NoNewline -ForegroundColor Red -BackgroundColor Yellow
-	Write-Host " already exists." -ForegroundColor Red
-	Write-Host "Please delete existing instance or use new sql Instance name by using parameter" -NoNewline 
-	Write-Host " -SQLServerName"   -ForegroundColor Green
-    exit 1
-}  
+#region Check If SQL Server Exist - REMOVED
+# This check has been removed to allow idempotent deployment
+# The script now properly handles existing SQL Servers in the main deployment section
 #endregion
 
 #region Dowloading assets if provided
@@ -507,22 +531,177 @@ $ServerUriPrivate = $SQLServerName+".privatelink.database.windows.net"
 $Connection="Server=tcp:"+$ServerUriPrivate+";Database="+$SQLDatabaseName+";TrustServerCertificate=True;Authentication=Active Directory Managed Identity;"
 
 Write-host "   🔵 Resource Group"
-Write-host "      ➡️ Create Resource Group"
+Write-host "      ➡️ Check if Resource Group exists"
+$rgExists = az group show --name $ResourceGroupForDeployment 2>$null
+if (-not $rgExists) {
+    Write-host "      ➡️ Creating Resource Group"
 az group create --location $Location --name $ResourceGroupForDeployment --output $azCliOutput
+    Write-host "      ✅ Resource Group created successfully"
+    Write-host "      ⏳ Waiting 10 seconds for resource group to be fully available..."
+    Start-Sleep -Seconds 10
+} else {
+    Write-host "      ✅ Resource Group already exists, using existing one"
+}
 
 Write-host "      ➡️ Create VNET and Subnet"
+Write-host "      🔍 Debug Info:"
+Write-host "         Resource Group: $ResourceGroupForDeployment"
+Write-host "         VNet Name: $VnetName"
+Write-host "         Location: $Location"
+Write-host "      ➡️ Checking if VNet '$VnetName' exists..."
+try {
+    $vnetExists = az network vnet show --resource-group $ResourceGroupForDeployment --name $VnetName 2>$null
+    if ($LASTEXITCODE -eq 0 -and $vnetExists) {
+        Write-host "      ✅ VNet '$VnetName' already exists, using existing one"
+    } else {
+        Write-host "      ➡️ VNet '$VnetName' not found, creating it..."
+        az network vnet create --resource-group $ResourceGroupForDeployment --name $VnetName --address-prefixes "10.0.0.0/20" --output $azCliOutput
+        if ($LASTEXITCODE -eq 0) {
+            Write-host "      ✅ VNet created successfully"
+            Write-host "      ⏳ Waiting 5 seconds for VNet to be fully available..."
+            Start-Sleep -Seconds 5
+        } else {
+            Write-host "      ❌ VNet creation failed with exit code $LASTEXITCODE"
+            throw "VNet creation failed"
+        }
+    }
+} catch {
+    Write-host "      ❌ Error checking VNet existence: $($_.Exception.Message)"
+    Write-host "      ➡️ Attempting to create VNet anyway..."
 az network vnet create --resource-group $ResourceGroupForDeployment --name $VnetName --address-prefixes "10.0.0.0/20" --output $azCliOutput
-az network vnet subnet create --resource-group $ResourceGroupForDeployment --vnet-name $VnetName -n $DefaultSubnetName --address-prefixes "10.0.0.0/24" --output $azCliOutput
-az network vnet subnet create --resource-group $ResourceGroupForDeployment --vnet-name $VnetName -n $WebSubnetName --address-prefixes "10.0.1.0/24" --service-endpoints Microsoft.Sql Microsoft.KeyVault --delegations Microsoft.Web/serverfarms  --output $azCliOutput 
-az network vnet subnet create --resource-group $ResourceGroupForDeployment --vnet-name $VnetName -n $SqlSubnetName --address-prefixes "10.0.2.0/24"  --output $azCliOutput 
-az network vnet subnet create --resource-group $ResourceGroupForDeployment --vnet-name $VnetName -n $KvSubnetName --address-prefixes "10.0.3.0/24"   --output $azCliOutput 
+    if ($LASTEXITCODE -eq 0) {
+        Write-host "      ✅ VNet created successfully"
+        Write-host "      ⏳ Waiting 5 seconds for VNet to be fully available..."
+        Start-Sleep -Seconds 5
+    } else {
+        Write-host "      ❌ VNet creation failed with exit code $LASTEXITCODE"
+        throw "VNet creation failed"
+    }
+}
+
+Write-host "      ➡️ Create Subnets"
+Write-host "      ⏳ Waiting 5 seconds for VNet to be fully available for subnet operations..."
+Start-Sleep -Seconds 5
+
+# Manual verification that VNet is accessible
+Write-host "      🔍 Verifying VNet accessibility..."
+$vnetVerify = az network vnet show --resource-group $ResourceGroupForDeployment --name $VnetName --query "name" -o tsv 2>$null
+if ($LASTEXITCODE -eq 0 -and $vnetVerify) {
+    Write-host "      ✅ VNet verification successful: $vnetVerify"
+} else {
+    Write-host "      ❌ VNet verification failed - VNet may not be accessible"
+    Write-host "      💡 This could be a permissions issue or the VNet may be in a different resource group"
+    Write-host "      🔍 Attempting to continue anyway..."
+}
+
+# Check and create each subnet
+$subnets = @(
+    @{Name=$DefaultSubnetName; Prefix="10.0.0.0/24"},
+    @{Name=$WebSubnetName; Prefix="10.0.1.0/24"; ServiceEndpoints="Microsoft.Sql Microsoft.KeyVault"; Delegations="Microsoft.Web/serverfarms"},
+    @{Name=$SqlSubnetName; Prefix="10.0.2.0/24"},
+    @{Name=$KvSubnetName; Prefix="10.0.3.0/24"}
+)
+
+foreach ($subnet in $subnets) {
+    Write-host "      ➡️ Checking subnet '$($subnet.Name)'..."
+    try {
+        $subnetExists = az network vnet subnet show --resource-group $ResourceGroupForDeployment --vnet-name $VnetName --name $subnet.Name 2>$null
+        if ($LASTEXITCODE -eq 0 -and $subnetExists) {
+            Write-host "      ✅ Subnet '$($subnet.Name)' already exists, skipping"
+        } else {
+            Write-host "      ➡️ Creating subnet '$($subnet.Name)'"
+            $maxRetries = 3
+            $retryCount = 0
+            $success = $false
+            
+            while ($retryCount -lt $maxRetries -and -not $success) {
+                $retryCount++
+                Write-host "      🔄 Attempt $retryCount of $maxRetries..."
+                
+                $cmd = "az network vnet subnet create --resource-group $ResourceGroupForDeployment --vnet-name $VnetName -n $($subnet.Name) --address-prefixes $($subnet.Prefix)"
+                if ($subnet.ServiceEndpoints) {
+                    $cmd += " --service-endpoints $($subnet.ServiceEndpoints)"
+                }
+                if ($subnet.Delegations) {
+                    $cmd += " --delegations $($subnet.Delegations)"
+                }
+                $cmd += " --output $azCliOutput"
+                
+                Invoke-Expression $cmd
+                if ($LASTEXITCODE -eq 0) {
+                    Write-host "      ✅ Subnet '$($subnet.Name)' created successfully"
+                    $success = $true
+                } else {
+                    Write-host "      ❌ Subnet '$($subnet.Name)' creation failed with exit code $LASTEXITCODE"
+                    if ($retryCount -lt $maxRetries) {
+                        Write-host "      ⏳ Waiting 10 seconds before retry..."
+                        Start-Sleep -Seconds 10
+                    }
+                }
+            }
+            
+            if (-not $success) {
+                Write-host "      ❌ Failed to create subnet '$($subnet.Name)' after $maxRetries attempts"
+                Write-host "      💡 This subnet may already exist or there may be a permissions issue"
+            }
+        }
+    } catch {
+        Write-host "      ❌ Error checking subnet '$($subnet.Name)': $($_.Exception.Message)"
+        Write-host "      ➡️ Attempting to create subnet anyway..."
+        $cmd = "az network vnet subnet create --resource-group $ResourceGroupForDeployment --vnet-name $VnetName -n $($subnet.Name) --address-prefixes $($subnet.Prefix)"
+        if ($subnet.ServiceEndpoints) {
+            $cmd += " --service-endpoints $($subnet.ServiceEndpoints)"
+        }
+        if ($subnet.Delegations) {
+            $cmd += " --delegations $($subnet.Delegations)"
+        }
+        $cmd += " --output $azCliOutput"
+        Invoke-Expression $cmd
+        if ($LASTEXITCODE -eq 0) {
+            Write-host "      ✅ Subnet '$($subnet.Name)' created successfully"
+        } else {
+            Write-host "      ❌ Subnet '$($subnet.Name)' creation failed with exit code $LASTEXITCODE"
+        }
+    }
+} 
 
 Write-host "      ➡️ Create Sql Server"
+Write-host "      ➡️ Checking if SQL Server '$SQLServerName' exists..."
+try {
+    $sqlServerExists = az sql server show --name $SQLServerName --resource-group $ResourceGroupForDeployment 2>$null
+    if ($LASTEXITCODE -eq 0 -and $sqlServerExists) {
+        Write-host "      ✅ SQL Server '$SQLServerName' already exists, using existing one"
+    } else {
+        Write-host "      ➡️ Creating SQL Server '$SQLServerName'"
+        $userId = az ad signed-in-user show --query id -o tsv 
+        $userdisplayname = az ad signed-in-user show --query displayName -o tsv 
+        # Create SQL Server with both Azure AD and SQL Server authentication enabled
+        # This allows both Azure AD users and SQL Server username/password authentication
+        az sql server create --name $SQLServerName --resource-group $ResourceGroupForDeployment --location $Location --admin-user "sqladmin" --admin-password "YourSecurePassword123!" --external-admin-principal-type User --external-admin-name $userdisplayname --external-admin-sid $userId --output $azCliOutput
+        if ($LASTEXITCODE -eq 0) {
+            Write-host "      ✅ SQL Server created successfully"
+            Write-host "      ⏳ Waiting 10 seconds for SQL Server to be fully available..."
+            Start-Sleep -Seconds 10
+        } else {
+            Write-host "      ❌ SQL Server creation failed with exit code $LASTEXITCODE"
+            throw "SQL Server creation failed"
+        }
+    }
+} catch {
+    Write-host "      ❌ Error checking SQL Server existence: $($_.Exception.Message)"
+    Write-host "      ➡️ Attempting to create SQL Server anyway..."
 $userId = az ad signed-in-user show --query id -o tsv 
 $userdisplayname = az ad signed-in-user show --query displayName -o tsv 
-# Create SQL Server with both Azure AD and SQL Server authentication enabled
-# This allows both Azure AD users and SQL Server username/password authentication
-az sql server create --name $SQLServerName --resource-group $ResourceGroupForDeployment --location $Location --admin-user "sqladmin" --admin-password "YourSecurePassword123!" --external-admin-principal-type User --external-admin-name $userdisplayname --external-admin-sid $userId --output $azCliOutput
+    az sql server create --name $SQLServerName --resource-group $ResourceGroupForDeployment --location $Location --admin-user "sqladmin" --admin-password "YourSecurePassword123!" --external-admin-principal-type User --external-admin-name $userdisplayname --external-admin-sid $userId --output $azCliOutput
+    if ($LASTEXITCODE -eq 0) {
+        Write-host "      ✅ SQL Server created successfully"
+        Write-host "      ⏳ Waiting 10 seconds for SQL Server to be fully available..."
+        Start-Sleep -Seconds 10
+    } else {
+        Write-host "      ❌ SQL Server creation failed with exit code $LASTEXITCODE"
+        throw "SQL Server creation failed"
+    }
+}
 Write-host "      ➡️ Set minimalTlsVersion to 1.2"
 az sql server update --name $SQLServerName --resource-group $ResourceGroupForDeployment --set minimalTlsVersion="1.2"
 Write-host "      ➡️ Add SQL Server Firewall rules"
@@ -534,38 +713,62 @@ if ($env:ACC_CLOUD -eq $null){
 }
 
 Write-host "      ➡️ Create SQL DB"
+$sqlDbExists = az sql db show --name $SQLDatabaseName --server $SQLServerName --resource-group $ResourceGroupForDeployment 2>$null
+if (-not $sqlDbExists) {
+    Write-host "      ➡️ Creating SQL Database '$SQLDatabaseName'"
 az sql db create --resource-group $ResourceGroupForDeployment --server $SQLServerName --name $SQLDatabaseName  --edition Standard  --capacity 10 --zone-redundant false --output $azCliOutput
+    Write-host "      ✅ SQL Database created successfully"
+    Write-host "      ⏳ Waiting 5 seconds for SQL Database to be fully available..."
+    Start-Sleep -Seconds 5
+} else {
+    Write-host "      ✅ SQL Database '$SQLDatabaseName' already exists, using existing one"
+}
 
 Write-host "   🔵 KeyVault"
-Write-host "      ➡️ Create KeyVault"
-# Check if KeyVault exists and handle firewall issues
+Write-host "      ➡️ Configuring KeyVault"
+# Check if KeyVault exists and create if needed
 $kvExists = az keyvault show --name $KeyVault --resource-group $ResourceGroupForDeployment 2>$null
 if (-not $kvExists) {
+    Write-host "      ➡️ Creating KeyVault '$KeyVault'"
     try {
-        az keyvault create --name $KeyVault --resource-group $ResourceGroupForDeployment --enable-rbac-authorization false --output $azCliOutput
+        az keyvault create --name $KeyVault --resource-group $ResourceGroupForDeployment --location $Location --enable-rbac-authorization false --output $azCliOutput
         Write-host "      ✅ KeyVault created successfully"
     } catch {
         if ($_.Exception.Message -like "*deleted state*") {
             Write-host "      ⚠️ KeyVault exists in soft-deleted state, purging..."
             az keyvault purge --name $KeyVault
             Start-Sleep -Seconds 30
-            az keyvault create --name $KeyVault --resource-group $ResourceGroupForDeployment --enable-rbac-authorization false --output $azCliOutput
+            az keyvault create --name $KeyVault --resource-group $ResourceGroupForDeployment --location $Location --enable-rbac-authorization false --output $azCliOutput
             Write-host "      ✅ KeyVault created successfully after purge"
         } elseif ($_.Exception.Message -like "*token*" -or $_.Exception.Message -like "*expired*") {
             Write-host "      ⚠️ Azure CLI token expired, refreshing..."
             az account get-access-token --resource https://management.azure.com/ --output none
-            az keyvault create --name $KeyVault --resource-group $ResourceGroupForDeployment --enable-rbac-authorization false --output $azCliOutput
+            az keyvault create --name $KeyVault --resource-group $ResourceGroupForDeployment --location $Location --enable-rbac-authorization false --output $azCliOutput
             Write-host "      ✅ KeyVault created successfully after token refresh"
         } else {
             Write-host "      ❌ KeyVault creation failed: $($_.Exception.Message)"
             throw "KeyVault creation failed. Please resolve the issue and retry."
         }
     }
-} else {
-    Write-host "      ➡️ KeyVault already exists, skipping creation"
-}
+         } else {
+             Write-host "      ✅ KeyVault '$KeyVault' already exists, using existing one"
+         }
+
+         Write-host "      ⏳ Waiting 5 seconds for KeyVault to be fully available..."
+         Start-Sleep -Seconds 5
 
 Write-host "      ➡️ Add Secrets"
+# Add current user's IP to KeyVault firewall to allow script execution
+Write-host "      🔧 Adding current IP to KeyVault firewall..."
+$currentIp = (Invoke-WebRequest -uri "https://api.ipify.org").Content
+Write-host "      📍 Current IP: $currentIp"
+try {
+    az keyvault network-rule add --name $KeyVault --resource-group $ResourceGroupForDeployment --ip-address $currentIp --output $azCliOutput
+    Write-host "      ✅ IP added to KeyVault firewall"
+} catch {
+    Write-host "      ⚠️ Could not add IP to firewall, trying to add secrets anyway..."
+}
+
 az keyvault secret set --vault-name $KeyVault --name ADApplicationSecret --value="$ADApplicationSecret" --output $azCliOutput
 az keyvault secret set --vault-name $KeyVault --name DefaultConnection --value $Connection --output $azCliOutput
 Write-host "      ➡️ Update Firewall"
@@ -573,28 +776,79 @@ az keyvault update --name $KeyVault --resource-group $ResourceGroupForDeployment
 az keyvault network-rule add --name $KeyVault --resource-group $ResourceGroupForDeployment --vnet-name $VnetName --subnet $WebSubnetName --output $azCliOutput
 
 Write-host "   🔵 App Service Plan"
-Write-host "      ➡️ Create App Service Plan"
+Write-host "      ➡️ Check if App Service Plan exists"
+$aspExists = az appservice plan show --name $WebAppNameService --resource-group $ResourceGroupForDeployment 2>$null
+if (-not $aspExists) {
+    Write-host "      ➡️ Creating App Service Plan '$WebAppNameService'"
 az appservice plan create -g $ResourceGroupForDeployment -n $WebAppNameService --sku B1 --output $azCliOutput
+    Write-host "      ✅ App Service Plan created successfully"
+    Write-host "      ⏳ Waiting 5 seconds for App Service Plan to be fully available..."
+    Start-Sleep -Seconds 5
+} else {
+    Write-host "      ✅ App Service Plan '$WebAppNameService' already exists, using existing one"
+}
 
 Write-host "   🔵 Admin Portal WebApp"
-Write-host "      ➡️ Create Web App"
+Write-host "      ➡️ Check if Admin WebApp exists"
+$adminWebAppExists = az webapp show --name $WebAppNameAdmin --resource-group $ResourceGroupForDeployment 2>$null
+if (-not $adminWebAppExists) {
+    Write-host "      ➡️ Creating Admin WebApp '$WebAppNameAdmin'"
 az webapp create -g $ResourceGroupForDeployment -p $WebAppNameService -n $WebAppNameAdmin  --runtime dotnet:8 --output $azCliOutput
+    # Enable VNet route all to ensure traffic routes through VNet for private endpoint access
+    az webapp config set -g $ResourceGroupForDeployment -n $WebAppNameAdmin --vnet-route-all-enabled true --output $azCliOutput
+    Write-host "      ✅ Admin WebApp created successfully"
+    Write-host "      ⏳ Waiting 15 seconds for Admin WebApp to be fully available..."
+    Start-Sleep -Seconds 15
+} else {
+    Write-host "      ✅ Admin WebApp '$WebAppNameAdmin' already exists, using existing one"
+    # Ensure VNet route all is enabled for existing WebApp
+    Write-host "      🔧 Ensuring VNet route all is enabled..."
+    az webapp config set -g $ResourceGroupForDeployment -n $WebAppNameAdmin --vnet-route-all-enabled true --output $azCliOutput
+}
+
 Write-host "      ➡️ Assign Identity"
 $WebAppNameAdminId = az webapp identity assign -g $ResourceGroupForDeployment  -n $WebAppNameAdmin --identities [system] --query principalId -o tsv
+Write-host "      ⏳ Waiting 5 seconds for identity assignment to propagate..."
+Start-Sleep -Seconds 25
+
 Write-host "      ➡️ Setup access to KeyVault"
 az keyvault set-policy --name $KeyVault  --object-id $WebAppNameAdminId --secret-permissions get list --key-permissions get list --resource-group $ResourceGroupForDeployment --output $azCliOutput
+Write-host "      ⏳ Waiting 5 seconds for KeyVault policy to propagate..."
+Start-Sleep -Seconds 25
+
 Write-host "      ➡️ Set Configuration"
 az webapp config connection-string set -g $ResourceGroupForDeployment -n $WebAppNameAdmin -t SQLAzure --output $azCliOutput --settings DefaultConnection=$DefaultConnectionKeyVault 
 az webapp config appsettings set -g $ResourceGroupForDeployment  -n $WebAppNameAdmin --output $azCliOutput --settings KnownUsers=$PublisherAdminUsers SaaSApiConfiguration__AdAuthenticationEndPoint=https://login.microsoftonline.com SaaSApiConfiguration__ClientId=$ADApplicationID SaaSApiConfiguration__ClientSecret=$ADApplicationSecretKeyVault SaaSApiConfiguration__FulFillmentAPIBaseURL=https://marketplaceapi.microsoft.com/api SaaSApiConfiguration__FulFillmentAPIVersion=2018-08-31 SaaSApiConfiguration__GrantType=client_credentials SaaSApiConfiguration__MTClientId=$ADApplicationIDAdmin SaaSApiConfiguration__IsAdminPortalMultiTenant=$IsAdminPortalMultiTenant SaaSApiConfiguration__Resource=20e940b3-4c77-4b0b-9a53-9e16a1b010a7 SaaSApiConfiguration__TenantId=$TenantID SaaSApiConfiguration__SignedOutRedirectUri=https://$WebAppNamePrefix-admin.azurewebsites.net/Home/Index/ SaaSApiConfiguration_CodeHash=$SaaSApiConfiguration_CodeHash
 az webapp config set -g $ResourceGroupForDeployment -n $WebAppNameAdmin --always-on true  --output $azCliOutput
 
 Write-host "   🔵 Customer Portal WebApp"
-Write-host "      ➡️ Create Web App"
+Write-host "      ➡️ Check if Customer WebApp exists"
+$portalWebAppExists = az webapp show --name $WebAppNamePortal --resource-group $ResourceGroupForDeployment 2>$null
+if (-not $portalWebAppExists) {
+    Write-host "      ➡️ Creating Customer WebApp '$WebAppNamePortal'"
 az webapp create -g $ResourceGroupForDeployment -p $WebAppNameService -n $WebAppNamePortal --runtime dotnet:8 --output $azCliOutput
+    # Enable VNet route all to ensure traffic routes through VNet for private endpoint access
+    az webapp config set -g $ResourceGroupForDeployment -n $WebAppNamePortal --vnet-route-all-enabled true --output $azCliOutput
+    Write-host "      ✅ Customer WebApp created successfully"
+    Write-host "      ⏳ Waiting 15 seconds for Customer WebApp to be fully available..."
+    Start-Sleep -Seconds 15
+} else {
+    Write-host "      ✅ Customer WebApp '$WebAppNamePortal' already exists, using existing one"
+    # Ensure VNet route all is enabled for existing WebApp
+    Write-host "      🔧 Ensuring VNet route all is enabled..."
+    az webapp config set -g $ResourceGroupForDeployment -n $WebAppNamePortal --vnet-route-all-enabled true --output $azCliOutput
+}
+
 Write-host "      ➡️ Assign Identity"
 $WebAppNamePortalId= az webapp identity assign -g $ResourceGroupForDeployment  -n $WebAppNamePortal --identities [system] --query principalId -o tsv 
+Write-host "      ⏳ Waiting 5 seconds for identity assignment to propagate..."
+Start-Sleep -Seconds 5
+
 Write-host "      ➡️ Setup access to KeyVault"
 az keyvault set-policy --name $KeyVault  --object-id $WebAppNamePortalId --secret-permissions get list --key-permissions get list --resource-group $ResourceGroupForDeployment --output $azCliOutput
+Write-host "      ⏳ Waiting 5 seconds for KeyVault policy to propagate..."
+Start-Sleep -Seconds 5
+
 Write-host "      ➡️ Set Configuration"
 az webapp config connection-string set -g $ResourceGroupForDeployment -n $WebAppNamePortal -t SQLAzure --output $azCliOutput --settings DefaultConnection="@Microsoft.KeyVault(VaultName=$KeyVault;SecretName=PortalConnection) "
 az webapp config appsettings set -g $ResourceGroupForDeployment  -n $WebAppNamePortal --output $azCliOutput --settings SaaSApiConfiguration__AdAuthenticationEndPoint=https://login.microsoftonline.com SaaSApiConfiguration__ClientId=$ADApplicationID SaaSApiConfiguration__ClientSecret=$ADApplicationSecretKeyVault SaaSApiConfiguration__FulFillmentAPIBaseURL=https://marketplaceapi.microsoft.com/api SaaSApiConfiguration__FulFillmentAPIVersion=2018-08-31 SaaSApiConfiguration__GrantType=client_credentials SaaSApiConfiguration__MTClientId=$ADMTApplicationIDPortal SaaSApiConfiguration__Resource=20e940b3-4c77-4b0b-9a53-9e16a1b010a7 SaaSApiConfiguration__TenantId=$TenantID SaaSApiConfiguration__SignedOutRedirectUri=https://$WebAppNamePrefix-portal.azurewebsites.net/Home/Index/ SaaSApiConfiguration_CodeHash=$SaaSApiConfiguration_CodeHash
@@ -605,7 +859,89 @@ az webapp config set -g $ResourceGroupForDeployment -n $WebAppNamePortal --alway
 #region Deploy Code
 Write-host "📜 Deploy Code"
 
-Write-host "   🔵 Deploy Database"
+Write-host "   🔵 Deploy Code to Admin Portal"
+az webapp deploy --resource-group $ResourceGroupForDeployment --name $WebAppNameAdmin --src-path "../Publish/AdminSite.zip" --type zip --output $azCliOutput
+Write-host "      ⏳ Waiting 10 seconds for Admin WebApp deployment to complete..."
+Start-Sleep -Seconds 10
+
+Write-host "   🔵 Deploy Code to Customer Portal"
+az webapp deploy --resource-group $ResourceGroupForDeployment --name $WebAppNamePortal --src-path "../Publish/CustomerSite.zip" --type zip --output $azCliOutput
+Write-host "      ⏳ Waiting 10 seconds for Customer WebApp deployment to complete..."
+Start-Sleep -Seconds 10
+
+Write-host "   🔵 Update Firewall for WebApps and SQL"
+# Use full resource IDs to avoid warnings about resource group assumptions
+$vnetResourceId = "/subscriptions/$AzureSubscriptionID/resourceGroups/$ResourceGroupForDeployment/providers/Microsoft.Network/virtualNetworks/$VnetName"
+$subnetResourceId = "$vnetResourceId/subnets/$WebSubnetName"
+
+Write-host "      ➡️ Adding VNet integration for Customer Portal"
+az webapp vnet-integration add --resource-group $ResourceGroupForDeployment --name $WebAppNamePortal --subnet $subnetResourceId --output $azCliOutput
+
+Write-host "      ➡️ Adding VNet integration for Admin Portal"
+az webapp vnet-integration add --resource-group $ResourceGroupForDeployment --name $WebAppNameAdmin --subnet $subnetResourceId --output $azCliOutput
+
+Write-host "      ➡️ Creating SQL Server VNet rule"
+az sql server vnet-rule create --name $WebAppNamePrefix-vnet --resource-group $ResourceGroupForDeployment --server $SQLServerName --vnet-name $VnetName --subnet $WebSubnetName --output $azCliOutput
+
+Write-host "   🔵 Clean up"
+Write-host "      ➡️ Cleaning up temporary files..."
+# Remove temporary files if they exist
+if (Test-Path "../src/AdminSite/appsettings.Development.json") {
+    Remove-Item -Path "../src/AdminSite/appsettings.Development.json" -Force
+    Write-host "      ✅ Removed appsettings.Development.json"
+} else {
+    Write-host "      ℹ️ appsettings.Development.json not found, skipping"
+}
+
+if (Test-Path "script.sql") {
+    Remove-Item -Path "script.sql" -Force
+    Write-host "      ✅ Removed script.sql"
+} else {
+    Write-host "      ℹ️ script.sql not found, skipping"
+}
+
+#Remove-Item -Path ../Publish -recurse -Force
+
+#endregion
+
+#region Create SQL Private Endpoints
+# Get SQL Server
+$sqlServerId=az sql server show --name $SQLServerName --resource-group $ResourceGroupForDeployment --query id -o tsv
+
+# Create a private endpoint
+az network private-endpoint create --name $privateSqlEndpointName --resource-group $ResourceGroupForDeployment --vnet-name $vnetName --subnet $SqlSubnetName --private-connection-resource-id $sqlServerId --group-ids sqlServer --connection-name sqlConnection
+
+
+# Create a SQL private DNS zone
+az network private-dns zone create --name $privateSqlDnsZoneName --resource-group $ResourceGroupForDeployment
+
+# Link the SQL private DNS zone to the VNet
+az network private-dns link vnet create --name $privateSqlLink --resource-group $ResourceGroupForDeployment --virtual-network $vnetName --zone-name $privateSqlDnsZoneName --registration-enabled false
+
+az network private-endpoint dns-zone-group create --resource-group $ResourceGroupForDeployment --endpoint-name $privateSqlEndpointName --name "sql-zone-group"   --private-dns-zone $privateSqlDnsZoneName   --zone-name "sqlserver"
+#endregion
+
+
+#region Create KV Private Endpoints
+# Get KV Server
+$keyVaultId=az keyvault show --name $KeyVault --resource-group $ResourceGroupForDeployment --query id -o tsv
+
+# Create a KV private endpoint
+az network private-endpoint create --name $privateKvEndpointName --resource-group $ResourceGroupForDeployment --vnet-name $vnetName --subnet $KvSubnetName --private-connection-resource-id $keyVaultId --group-ids vault  --connection-name kvConnection
+
+
+# Create a KV private DNS zone
+az network private-dns zone create --name $privateKvDnsZoneName --resource-group $ResourceGroupForDeployment
+
+# Link the KV private DNS zone to the VNet
+az network private-dns link vnet create --name $privateKvLink --resource-group $ResourceGroupForDeployment --virtual-network $vnetName --zone-name $privateKvDnsZoneName --registration-enabled false
+
+az network private-endpoint dns-zone-group create --resource-group $ResourceGroupForDeployment --endpoint-name $privateKvEndpointName --name "Kv-zone-group"   --private-dns-zone $privateKvDnsZoneName   --zone-name "Kv-zone"
+#endregion
+
+#region Configure Database
+Write-host "🗄️ Configure Database"
+Write-host "   🔵 Deploy Database Schema and Users"
 Write-host "      ➡️ Generate SQL schema/data script"
 # Use SQL Server authentication for migration script generation
 # This ensures migrations work reliably without Azure AD token issues
@@ -658,60 +994,24 @@ try {
     }
 }
 
-Write-host "   🔵 Deploy Code to Admin Portal"
-az webapp deploy --resource-group $ResourceGroupForDeployment --name $WebAppNameAdmin --src-path "../Publish/AdminSite.zip" --type zip --output $azCliOutput
+Write-host "   🔵 Final Database Cleanup"
+Write-host "      ➡️ Cleaning up database-related temporary files..."
+# Remove temporary files if they exist
+if (Test-Path "../src/AdminSite/appsettings.Development.json") {
+    Remove-Item -Path "../src/AdminSite/appsettings.Development.json" -Force
+    Write-host "      ✅ Removed appsettings.Development.json"
+} else {
+    Write-host "      ℹ️ appsettings.Development.json not found, skipping"
+}
 
-Write-host "   🔵 Deploy Code to Customer Portal"
-az webapp deploy --resource-group $ResourceGroupForDeployment --name $WebAppNamePortal --src-path "../Publish/CustomerSite.zip" --type zip --output $azCliOutput
-
-Write-host "   🔵 Update Firewall for WebApps and SQL"
-az webapp vnet-integration add --resource-group $ResourceGroupForDeployment --name $WebAppNamePortal --vnet $VnetName --subnet $WebSubnetName --output $azCliOutput
-az webapp vnet-integration add --resource-group $ResourceGroupForDeployment --name $WebAppNameAdmin --vnet $VnetName --subnet $WebSubnetName --output $azCliOutput
-az sql server vnet-rule create --name $WebAppNamePrefix-vnet --resource-group $ResourceGroupForDeployment --server $SQLServerName --vnet-name $VnetName --subnet $WebSubnetName --output $azCliOutput
-
-Write-host "   🔵 Clean up"
-Remove-Item -Path ../src/AdminSite/appsettings.Development.json
-Remove-Item -Path script.sql
-#Remove-Item -Path ../Publish -recurse -Force
-
+if (Test-Path "script.sql") {
+    Remove-Item -Path "script.sql" -Force
+    Write-host "      ✅ Removed script.sql"
+} else {
+    Write-host "      ℹ️ script.sql not found, skipping"
+}
+Write-host "      ✅ Database configuration completed successfully"
 #endregion
-
-#region Create SQL Private Endpoints
-# Get SQL Server
-$sqlServerId=az sql server show --name $SQLServerName --resource-group $ResourceGroupForDeployment --query id -o tsv
-
-# Create a private endpoint
-az network private-endpoint create --name $privateSqlEndpointName --resource-group $ResourceGroupForDeployment --vnet-name $vnetName --subnet $SqlSubnetName --private-connection-resource-id $sqlServerId --group-ids sqlServer --connection-name sqlConnection
-
-
-# Create a SQL private DNS zone
-az network private-dns zone create --name $privateSqlDnsZoneName --resource-group $ResourceGroupForDeployment
-
-# Link the SQL private DNS zone to the VNet
-az network private-dns link vnet create --name $privateSqlLink --resource-group $ResourceGroupForDeployment --virtual-network $vnetName --zone-name $privateSqlDnsZoneName --registration-enabled false
-
-az network private-endpoint dns-zone-group create --resource-group $ResourceGroupForDeployment --endpoint-name $privateSqlEndpointName --name "sql-zone-group"   --private-dns-zone $privateSqlDnsZoneName   --zone-name "sqlserver"
-#endregion
-
-
-#region Create KV Private Endpoints
-# Get KV Server
-$keyVaultId=az keyvault show --name $KeyVault --resource-group $ResourceGroupForDeployment --query id -o tsv
-
-# Create a KV private endpoint
-az network private-endpoint create --name $privateKvEndpointName --resource-group $ResourceGroupForDeployment --vnet-name $vnetName --subnet $KvSubnetName --private-connection-resource-id $keyVaultId --group-ids vault  --connection-name kvConnection
-
-
-# Create a KV private DNS zone
-az network private-dns zone create --name $privateKvDnsZoneName --resource-group $ResourceGroupForDeployment
-
-# Link the KV private DNS zone to the VNet
-az network private-dns link vnet create --name $privateKvLink --resource-group $ResourceGroupForDeployment --virtual-network $vnetName --zone-name $privateKvDnsZoneName --registration-enabled false
-
-az network private-endpoint dns-zone-group create --resource-group $ResourceGroupForDeployment --endpoint-name $privateKvEndpointName --name "Kv-zone-group"   --private-dns-zone $privateKvDnsZoneName   --zone-name "Kv-zone"
-#endregion
-
-
 
 #region Present Output
 
