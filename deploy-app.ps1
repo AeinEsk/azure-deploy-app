@@ -220,12 +220,23 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "      ✅ Migration script generated" -ForegroundColor Green
 
 Write-Host "      ➡️ Executing SQL migration script..." -ForegroundColor Blue
+# Use Azure AD authentication for executing migrations
+$AzureADConnectionString = "Server=tcp:" + $ServerUri + ";Database=" + $SQLDatabaseName + ";Authentication=Active Directory Default;TrustServerCertificate=True;"
+Write-Host "      ➡️ Using Azure AD authentication..." -ForegroundColor Blue
+
 try {
-    Invoke-Sqlcmd -InputFile ./script.sql -ConnectionString $ConnectionString
+    Invoke-Sqlcmd -InputFile ./script.sql -ConnectionString $AzureADConnectionString
     Write-Host "      ✅ Database migrations executed successfully" -ForegroundColor Green
 } catch {
     Write-Host "      ❌ Failed to execute migrations: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "      💡 You may need to run the migrations manually" -ForegroundColor Yellow
+    if ($_.Exception.Message -like "*Login failed*" -or $_.Exception.Message -like "*token-identified*") {
+        Write-Host "      💡 Your Azure AD account needs to be added as an Azure AD admin on the SQL Server" -ForegroundColor Yellow
+        Write-Host "      💡 To add yourself as admin, run:" -ForegroundColor Yellow
+        $userId = az ad signed-in-user show --query id -o tsv
+        Write-Host "         az sql server ad-admin create --resource-group $ResourceGroupForDeployment --server-name $SQLServerName --display-name 'Current User' --object-id $userId" -ForegroundColor Cyan
+        Write-Host "      💡 Or add yourself via Azure Portal: SQL Server '$SQLServerName' > Azure Active Directory > Set admin" -ForegroundColor Yellow
+    }
+    Write-Host "      💡 Alternatively, run the migrations manually using Azure Data Studio or SSMS with Azure AD auth" -ForegroundColor Yellow
     throw
 }
 
